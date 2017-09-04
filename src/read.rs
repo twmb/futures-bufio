@@ -1,4 +1,5 @@
-use futures::prelude::*;
+use futures::Future;
+use futures::future::{Either, ok};
 use futures_cpupool::CpuPool;
 
 use std::io::{self, Read};
@@ -9,7 +10,7 @@ use common::EXP_POOL;
 /// Adds buffering to any reader, similar to the [standard `BufReader`], but performs non-buffer
 /// reads in a thread pool.
 ///
-/// All reads are returned as futures using the `#[async]` attribute.
+/// All reads are returned as futures.
 ///
 /// This reader is most useful for wrapping readers that never block, but are slow. Notably, this
 /// is most useful for wrapping `io::File`.
@@ -248,8 +249,10 @@ impl<R: Read + Send + 'static> BufReader<R> {
     /// assert_eq!(&buf[..n], b"foo text");
     /// # }
     /// ```
-    #[async]
-    pub fn try_read_full(mut self, mut buf: Box<[u8]>) -> Result<OkRead<Self>, ErrRead<Self>> {
+    pub fn try_read_full(
+        mut self,
+        mut buf: Box<[u8]>,
+    ) -> impl Future<Item = OkRead<Self>, Error = ErrRead<Self>> {
         const U8READ: &str = "&[u8] reads never error";
         let mut rem = buf.len();
         let mut at = 0;
@@ -262,7 +265,7 @@ impl<R: Read + Send + 'static> BufReader<R> {
             self.pos += at;
 
             if rem == 0 {
-                return Ok((self, buf, at));
+                return Either::A(ok::<OkRead<Self>, ErrRead<Self>>((self, buf, at)));
             }
         }
         // self.pos == self.cap
@@ -301,7 +304,7 @@ impl<R: Read + Send + 'static> BufReader<R> {
             }
         });
 
-        match fut.wait() {
+        Either::B(fut.then(|res| match res {
             Ok(mut x) => {
                 x.0.pool = Some(pool);
                 Ok(x)
@@ -310,7 +313,7 @@ impl<R: Read + Send + 'static> BufReader<R> {
                 x.0.pool = Some(pool);
                 Err(x)
             }
-        }
+        }))
     }
 }
 
