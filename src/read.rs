@@ -10,15 +10,15 @@ use common::EXP_POOL;
 /// Adds buffering to any reader, similar to the [standard `BufReader`], but performs non-buffer
 /// reads in a thread pool.
 ///
+/// [standard `BufReader`]: https://doc.rust-lang.org/std/io/struct.BufReader.html
+///
 /// All reads are returned as futures.
 ///
-/// This reader is most useful for wrapping readers that never block, but are slow. Notably, this
-/// is most useful for wrapping `io::File`.
+/// This reader is most useful for wrapping readers that never block or cannot return EWOULDBLOCK,
+/// but are slow. Notably, this is useful for wrapping `io::File`.
 ///
 /// All reads must take and own the `BufReader` and the buffer being written for the duration of
 /// the read.
-///
-/// [standard `BufReader`]: https://doc.rust-lang.org/std/io/struct.BufReader.html
 ///
 /// # Examples
 /// ```
