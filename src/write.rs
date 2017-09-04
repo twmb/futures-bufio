@@ -1,4 +1,5 @@
-use futures::prelude::*;
+use futures::Future;
+use futures::future::{Either, ok};
 use futures_cpupool::CpuPool;
 
 use std::io::{self, Write};
@@ -11,7 +12,7 @@ use common::*;
 ///
 /// [standard `BufWriter`]: https://doc.rust-lang.org/std/io/struct.BufWriter.html
 ///
-/// All writes are returned as futures using the `#[async]` attribute.
+/// All writes are returned as futures.
 ///
 /// Note that unlike the standard `BufWriter`, this `BufWriter` is _not_ automatically flushed on
 /// drop. Users must call [`flush_buf`] and potentially [`flush_inner`] to flush contents before
@@ -237,8 +238,10 @@ impl<W: Write + Send + 'static> BufWriter<W> {
     /// assert_eq!(&*buf, b"many small writes"); // we can reuse buf
     /// # }
     /// ```
-    #[async]
-    pub fn write_all(mut self, buf: Box<[u8]>) -> Result<OkWrite<Self>, ErrWrite<Self>> {
+    pub fn write_all(
+        mut self,
+        buf: Box<[u8]>,
+    ) -> impl Future<Item = OkWrite<Self>, Error = ErrWrite<Self>> {
         let mut rem = buf.len();
         let mut at = 0;
         let mut write_buf = false;
@@ -246,7 +249,7 @@ impl<W: Write + Send + 'static> BufWriter<W> {
         if self.pos == 0 {
             if buf.len() < self.buf.len() {
                 self.pos = copy(&mut self.buf, &*buf);
-                return Ok((self, buf));
+                return Either::A(ok::<OkWrite<Self>, ErrWrite<Self>>((self, buf)));
             }
         } else {
             at = copy(&mut self.buf[self.pos..], &*buf);
@@ -254,7 +257,7 @@ impl<W: Write + Send + 'static> BufWriter<W> {
             rem -= at;
 
             if self.pos != self.buf.len() {
-                return Ok((self, buf));
+                return Either::A(ok::<OkWrite<Self>, ErrWrite<Self>>((self, buf)));
             }
             write_buf = true;
         }
@@ -286,7 +289,7 @@ impl<W: Write + Send + 'static> BufWriter<W> {
             Ok((self, buf))
         });
 
-        match fut.wait() {
+        Either::B(fut.then(|res| match res {
             Ok(mut x) => {
                 x.0.pool = Some(pool);
                 Ok(x)
@@ -295,7 +298,7 @@ impl<W: Write + Send + 'static> BufWriter<W> {
                 x.0.pool = Some(pool);
                 Err(x)
             }
-        }
+        }))
     }
 
     /// Flushes currently buffered data to the inner writer.
@@ -307,10 +310,9 @@ impl<W: Write + Send + 'static> BufWriter<W> {
     /// ```ignore
     /// let future = writer.flush_buf();
     /// ```
-    #[async]
-    pub fn flush_buf(mut self) -> Result<Self, (Self, io::Error)> {
+    pub fn flush_buf(mut self) -> impl Future<Item = Self, Error = (Self, io::Error)> {
         if self.w_start == self.pos {
-            return Ok(self);
+            return Either::A(ok::<Self, (Self, io::Error)>(self));
         }
 
         let pool = self.pool.take().expect(EXP_POOL);
@@ -322,7 +324,7 @@ impl<W: Write + Send + 'static> BufWriter<W> {
             Ok(self)
         });
 
-        match fut.wait() {
+        Either::B(fut.then(|res| match res {
             Ok(mut me) => {
                 me.pool = Some(pool);
                 Ok(me)
@@ -331,7 +333,7 @@ impl<W: Write + Send + 'static> BufWriter<W> {
                 x.0.pool = Some(pool);
                 Err(x)
             }
-        }
+        }))
     }
 
     /// Calls [`flush`] on the inner writer.
@@ -342,8 +344,7 @@ impl<W: Write + Send + 'static> BufWriter<W> {
     /// ```ignore
     /// let future = writer.flush_inner();
     /// ```
-    #[async]
-    pub fn flush_inner(mut self) -> Result<Self, (Self, io::Error)> {
+    pub fn flush_inner(mut self) -> impl Future<Item = Self, Error = (Self, io::Error)> {
         let pool = self.pool.take().expect(EXP_POOL);
         let fut = pool.spawn_fn(move || {
             if let Err(e) = self.inner.flush() {
@@ -352,7 +353,7 @@ impl<W: Write + Send + 'static> BufWriter<W> {
             Ok(self)
         });
 
-        match fut.wait() {
+        fut.then(|res| match res {
             Ok(mut me) => {
                 me.pool = Some(pool);
                 Ok(me)
@@ -361,7 +362,7 @@ impl<W: Write + Send + 'static> BufWriter<W> {
                 x.0.pool = Some(pool);
                 Err(x)
             }
-        }
+        })
     }
 }
 
