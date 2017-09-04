@@ -7,12 +7,18 @@ use std::mem;
 
 use common::*;
 
-/// Adds buffering to any writer, similar to the [standard `BufWriter`] but performs non-buffer
+/// Adds buffering to any writer, similar to the [standard `BufWriter`], but performs non-buffer
 /// writes in a thread pool.
 ///
 /// [standard `BufWriter`]: https://doc.rust-lang.org/std/io/struct.BufWriter.html
 ///
 /// All writes are returned as futures.
+///
+/// This writer is most useful for wrapping writers that never block or cannot return EWOULDBLOCK,
+/// but are slow. Notably, this is useful for wrapping `io::File`.
+///
+/// All writes must take and own the `BufWriter` and the buffer being written for the duration of
+/// the write.
 ///
 /// Note that unlike the standard `BufWriter`, this `BufWriter` is _not_ automatically flushed on
 /// drop. Users must call [`flush_buf`] and potentially [`flush_inner`] to flush contents before
