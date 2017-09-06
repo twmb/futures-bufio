@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["Travis Bischel <travis.bischel@gmail.com>"]
 description = "Buffered IO with futures on top of a threadpool for blocking IO"
 documentation = "https://docs.rs/futures-bufio"
+repository = "https://github.com/twmb/futures-bufio"
 readme = "README.md"
 keywords = ["futures", "future", "bufio", "io", "async"]
 categories = ["asynchronous", "filesystem"]
