@@ -4,6 +4,7 @@ use futures_cpupool::CpuPool;
 
 use std::io::{self, Write};
 use std::mem;
+use std::ops::Deref;
 
 use common::*;
 
@@ -42,7 +43,7 @@ use common::*;
 /// let pool = CpuPool::new(1);
 /// let writer = BufWriter::with_pool_and_capacity(pool, 4096, f);
 ///
-/// let buf = b"many small writes".to_vec().into_boxed_slice();
+/// let buf = b"many small writes".to_vec();
 /// let (writer, buf) = writer.write_all(buf).wait().unwrap_or_else(|(_, _, e)| {
 ///     // in real usage, we have the option to deconstruct our BufWriter or reuse buf here
 ///     panic!("unable to read full: {}", e);
@@ -59,9 +60,9 @@ pub struct BufWriter<W> {
 }
 
 /// Wraps `W` with the original buffer being written.
-type OkWrite<W> = (W, Box<[u8]>);
+type OkWrite<W, B> = (W, B);
 /// Wraps `W` with the original buffer being written and the error encountered while writing.
-type ErrWrite<W> = (W, Box<[u8]>, io::Error);
+type ErrWrite<W, B> = (W, B, io::Error);
 
 impl<W: Write + Send + 'static> BufWriter<W> {
     /// Creates and returns a new `BufWriter` with an internal buffer of size `cap`.
@@ -236,7 +237,7 @@ impl<W: Write + Send + 'static> BufWriter<W> {
     /// let pool = CpuPool::new(1);
     /// let writer = BufWriter::with_pool_and_capacity(pool, 4096, f);
     ///
-    /// let buf = b"many small writes".to_vec().into_boxed_slice();
+    /// let buf = b"many small writes".to_vec();
     /// let (writer, buf) = writer.write_all(buf).wait().unwrap_or_else(|(_, _, e)| {
     ///     // in real usage, we have the option to deconstruct our BufWriter or reuse buf here
     ///     panic!("unable to read full: {}", e);
@@ -244,10 +245,13 @@ impl<W: Write + Send + 'static> BufWriter<W> {
     /// assert_eq!(&*buf, b"many small writes"); // we can reuse buf
     /// # }
     /// ```
-    pub fn write_all(
+    pub fn write_all<B>(
         mut self,
-        buf: Box<[u8]>,
-    ) -> impl Future<Item = OkWrite<Self>, Error = ErrWrite<Self>> {
+        buf: B,
+    ) -> impl Future<Item = OkWrite<Self, B>, Error = ErrWrite<Self, B>>
+    where
+        B: Deref<Target = [u8]> + Send + 'static,
+    {
         let mut rem = buf.len();
         let mut at = 0;
         let mut write_buf = false;
@@ -255,7 +259,7 @@ impl<W: Write + Send + 'static> BufWriter<W> {
         if self.pos == 0 {
             if buf.len() < self.buf.len() {
                 self.pos = copy(&mut self.buf, &*buf);
-                return Either::A(ok::<OkWrite<Self>, ErrWrite<Self>>((self, buf)));
+                return Either::A(ok::<OkWrite<Self, B>, ErrWrite<Self, B>>((self, buf)));
             }
         } else {
             at = copy(&mut self.buf[self.pos..], &*buf);
@@ -263,7 +267,7 @@ impl<W: Write + Send + 'static> BufWriter<W> {
             rem -= at;
 
             if self.pos != self.buf.len() {
-                return Either::A(ok::<OkWrite<Self>, ErrWrite<Self>>((self, buf)));
+                return Either::A(ok::<OkWrite<Self, B>, ErrWrite<Self, B>>((self, buf)));
             }
             write_buf = true;
         }
@@ -398,9 +402,11 @@ fn test_write() {
     );
 
     // memory (5)
-    let (f, buf) = f.write_all(b"hello".to_vec().into_boxed_slice())
-        .wait()
-        .unwrap_or_else(|(_, _, e)| panic!("unable to write to file: {}", e));
+    let (f, buf) = f.write_all(b"hello".to_vec()).wait().unwrap_or_else(
+        |(_, _, e)| {
+            panic!("unable to write to file: {}", e)
+        },
+    );
     assert_eq!(f.pos, 5);
     assert_eq!(f.w_start, 0);
     assert_eq!(&*buf, b"hello");
@@ -421,9 +427,11 @@ fn test_write() {
     assert_foo("hello");
 
     // memory (2) with w_start at 5
-    let (f, buf) = f.write_all(b"tw".to_vec().into_boxed_slice())
-        .wait()
-        .unwrap_or_else(|(_, _, e)| panic!("unable to write to file: {}", e));
+    let (f, buf) = f.write_all(b"tw".to_vec()).wait().unwrap_or_else(
+        |(_, _, e)| {
+            panic!("unable to write to file: {}", e)
+        },
+    );
     assert_eq!(f.pos, 7);
     assert_eq!(f.w_start, 5);
     assert_eq!(&*buf, b"tw");
@@ -437,16 +445,18 @@ fn test_write() {
     assert_foo("hellotw");
 
     // memory (7)
-    let (f, buf) = f.write_all(b"goodbye".to_vec().into_boxed_slice())
-        .wait()
-        .unwrap_or_else(|(_, _, e)| panic!("unable to write to file: {}", e));
+    let (f, buf) = f.write_all(b"goodbye".to_vec()).wait().unwrap_or_else(
+        |(_, _, e)| {
+            panic!("unable to write to file: {}", e)
+        },
+    );
     assert_eq!(f.pos, 4);
     assert_eq!(f.w_start, 0);
     assert_eq!(&*buf, b"goodbye");
     assert_foo("hellotwgoo");
 
     // memory (6) + disk (10)
-    let (f, buf) = f.write_all(b"more++andthenten".to_vec().into_boxed_slice())
+    let (f, buf) = f.write_all(b"more++andthenten".to_vec())
         .wait()
         .unwrap_or_else(|(_, _, e)| panic!("unable to write to file: {}", e));
     assert_eq!(f.pos, 0);
@@ -455,16 +465,18 @@ fn test_write() {
     assert_foo("hellotwgoodbyemore++andthenten");
 
     // disk (10)
-    let (f, buf) = f.write_all(b"andtenmore".to_vec().into_boxed_slice())
-        .wait()
-        .unwrap_or_else(|(_, _, e)| panic!("unable to write to file: {}", e));
+    let (f, buf) = f.write_all(b"andtenmore".to_vec()).wait().unwrap_or_else(
+        |(_, _, e)| {
+            panic!("unable to write to file: {}", e)
+        },
+    );
     assert_eq!(f.pos, 0);
     assert_eq!(f.w_start, 0);
     assert_eq!(&*buf, b"andtenmore");
     assert_foo("hellotwgoodbyemore++andthentenandtenmore");
 
     // disk (10) + mem (5)
-    let (f, buf) = f.write_all(b"this is rly old".to_vec().into_boxed_slice())
+    let (f, buf) = f.write_all(b"this is rly old".to_vec())
         .wait()
         .unwrap_or_else(|(_, _, e)| panic!("unable to write to file: {}", e));
     assert_eq!(f.pos, 5);

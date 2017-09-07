@@ -2,6 +2,8 @@ use futures::Future;
 use futures::future::{Either, ok};
 use futures_cpupool::CpuPool;
 
+use std::ops::DerefMut;
+
 use std::io::{self, Read};
 use std::mem;
 
@@ -35,7 +37,7 @@ use common::EXP_POOL;
 /// let pool = CpuPool::new(1);
 /// let reader = BufReader::with_pool_and_capacity(pool, 10, f);
 ///
-/// let buf = vec![0; 10].into_boxed_slice();
+/// let buf = vec![0; 10];
 /// let (reader, buf, n) = reader.try_read_full(buf).wait().unwrap_or_else(|(_, _, e)| {
 ///     // in real usage, we have the option to deconstruct our BufReader or reuse buf here
 ///     panic!("unable to read full: {}", e);
@@ -53,9 +55,9 @@ pub struct BufReader<R> {
 }
 
 /// Wraps `R` with the original buffer being read into and the number of bytes read.
-type OkRead<R> = (R, Box<[u8]>, usize);
+type OkRead<R, B> = (R, B, usize);
 /// Wraps `R` with the original buffer being read into and the error encountered while reading.
-type ErrRead<R> = (R, Box<[u8]>, io::Error);
+type ErrRead<R, B> = (R, B, io::Error);
 
 impl<R: Read + Send + 'static> BufReader<R> {
     /// Creates and returns a new `BufReader` with an internal buffer of size `cap`.
@@ -169,7 +171,7 @@ impl<R: Read + Send + 'static> BufReader<R> {
     /// // unsafely move the reader's position to the beginning of our known text, and read it
     /// unsafe { reader.set_pos(buf_len-p.len()); }
     /// let (_, b, _) = reader
-    ///     .try_read_full(vec![0; p.len()].into_boxed_slice())
+    ///     .try_read_full(vec![0; p.len()])
     ///     .wait()
     ///     .unwrap_or_else(|(_, _, e)| {
     ///         panic!("unable to read: {}", e);
@@ -239,7 +241,7 @@ impl<R: Read + Send + 'static> BufReader<R> {
     /// let pool = CpuPool::new(1);
     /// let reader = BufReader::with_pool_and_capacity(pool, 10, f);
     ///
-    /// let buf = vec![0; 10].into_boxed_slice();
+    /// let buf = vec![0; 10];
     /// let (reader, buf, n) = reader.try_read_full(buf).wait().unwrap_or_else(|(_, _, e)| {
     ///     // in real usage, we have the option to deconstruct our BufReader or reuse buf here
     ///     panic!("unable to read full: {}", e);
@@ -249,10 +251,13 @@ impl<R: Read + Send + 'static> BufReader<R> {
     /// assert_eq!(&buf[..n], b"foo text");
     /// # }
     /// ```
-    pub fn try_read_full(
+    pub fn try_read_full<B>(
         mut self,
-        mut buf: Box<[u8]>,
-    ) -> impl Future<Item = OkRead<Self>, Error = ErrRead<Self>> {
+        mut buf: B,
+    ) -> impl Future<Item = OkRead<Self, B>, Error = ErrRead<Self, B>>
+    where
+        B: DerefMut<Target = [u8]> + Send + 'static,
+    {
         const U8READ: &str = "&[u8] reads never error";
         let mut rem = buf.len();
         let mut at = 0;
@@ -265,7 +270,7 @@ impl<R: Read + Send + 'static> BufReader<R> {
             self.pos += at;
 
             if rem == 0 {
-                return Either::A(ok::<OkRead<Self>, ErrRead<Self>>((self, buf, at)));
+                return Either::A(ok::<OkRead<Self, B>, ErrRead<Self, B>>((self, buf, at)));
             }
         }
         // self.pos == self.cap
@@ -364,7 +369,7 @@ fn test_read() {
     assert_eq!(f.pos, 10);
 
     // disk read, no blocks
-    let (f, buf, n) = f.try_read_full(vec![0; 5].into()).wait().unwrap_or_else(
+    let (f, buf, n) = f.try_read_full(vec![0; 5]).wait().unwrap_or_else(
         |(_, _, e)| {
             panic!("unable to read: {}", e)
         },
@@ -376,7 +381,7 @@ fn test_read() {
     assert_eq!(&*f.buf, b"Strapped d");
 
     // mem read only
-    let (f, buf, n) = f.try_read_full(vec![0; 2].into()).wait().unwrap_or_else(
+    let (f, buf, n) = f.try_read_full(vec![0; 2]).wait().unwrap_or_else(
         |(_, _, e)| {
             panic!("unable to read: {}", e)
         },
@@ -388,7 +393,7 @@ fn test_read() {
     assert_eq!(&*f.buf, b"Strapped d");
 
     // mem (3) + disk blocks (20) + more mem (2)
-    let (f, buf, n) = f.try_read_full(vec![0; 25].into()).wait().unwrap_or_else(
+    let (f, buf, n) = f.try_read_full(vec![0; 25]).wait().unwrap_or_else(
         |(_, _, e)| {
             panic!("unable to read: {}", e)
         },
@@ -400,7 +405,7 @@ fn test_read() {
     assert_eq!(&*f.buf, b"cold, eyes");
 
     // mem (8) + disk block (10)
-    let (f, buf, n) = f.try_read_full(vec![0; 18].into()).wait().unwrap_or_else(
+    let (f, buf, n) = f.try_read_full(vec![0; 18]).wait().unwrap_or_else(
         |(_, _, e)| {
             panic!("unable to read: {}", e)
         },
@@ -412,7 +417,7 @@ fn test_read() {
     assert_eq!(&*f.buf, b"cold, eyes"); // non-reset buf
 
     // disk block (10)
-    let (f, buf, n) = f.try_read_full(vec![0; 10].into()).wait().unwrap_or_else(
+    let (f, buf, n) = f.try_read_full(vec![0; 10]).wait().unwrap_or_else(
         |(_, _, e)| {
             panic!("unable to read: {}", e)
         },
@@ -424,7 +429,7 @@ fn test_read() {
     assert_eq!(&*f.buf, b"cold, eyes");
 
     // disk block (20) + mem (9) (over-read by one byte)
-    let (f, buf, n) = f.try_read_full(vec![0; 29].into()).wait().unwrap_or_else(
+    let (f, buf, n) = f.try_read_full(vec![0; 29]).wait().unwrap_or_else(
         |(_, _, e)| {
             panic!("unable to read: {}", e)
         },
@@ -435,7 +440,7 @@ fn test_read() {
     assert_eq!(f.cap, 8);
     assert_eq!(&*f.buf, b" I dead?es");
 
-    let (f, buf, n) = f.try_read_full(vec![0; 2].into()).wait().unwrap_or_else(
+    let (f, buf, n) = f.try_read_full(vec![0; 2]).wait().unwrap_or_else(
         |(_, _, e)| {
             panic!("unable to read: {}", e)
         },
