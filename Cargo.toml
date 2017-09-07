@@ -1,6 +1,6 @@
 [package]
 name = "futures-bufio"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["Travis Bischel <travis.bischel@gmail.com>"]
 description = "Buffered IO with futures on top of a threadpool for blocking IO"
 documentation = "https://docs.rs/futures-bufio"
