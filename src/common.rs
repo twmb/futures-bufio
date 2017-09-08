@@ -1,6 +1,5 @@
-/// A common error string that we use whenever expecting a `CpuPool`.
-pub(crate) const EXP_POOL: &str = "pool is always put back when returning from functions that \
-                                   take it";
+/// A common error string that we use whenever expecting a `read()` call on a `&[u8]`.
+pub(crate) const U8READ: &str = "&[u8] reads never error";
 
 /// Copies as many `T` as possible from `src` into `dst`, returning the number of `T` copied. This
 /// function is short form for `dst.copy_from_slice(src)`, but accounts for if their lengths are
@@ -24,9 +23,9 @@ pub(crate) fn copy(dst: &mut [u8], src: &[u8]) -> usize {
     let src_len = src.len();
     let dst_len = dst.len();
     if dst_len >= src_len {
-        src.read(&mut dst[..src_len]).unwrap()
+        src.read(&mut dst[..src_len]).expect(U8READ)
     } else {
-        (&src[..dst_len]).read(dst).unwrap()
+        (&src[..dst_len]).read(dst).expect(U8READ)
     }
 }
 
