@@ -5,9 +5,7 @@ use futures_cpupool::CpuPool;
 use std::ops::DerefMut;
 
 use std::io::{self, Read};
-use std::mem;
-
-use common::EXP_POOL;
+use common::U8READ;
 
 /// Adds buffering to any reader, similar to the [standard `BufReader`], but performs non-buffer
 /// reads in a thread pool.
@@ -47,11 +45,15 @@ use common::EXP_POOL;
 /// # }
 /// ```
 pub struct BufReader<R> {
+    reader: BufReaderInner<R>,
+    pool: CpuPool,
+}
+
+struct BufReaderInner<R> {
     inner: R,
     buf: Box<[u8]>,
     pos: usize,
     cap: usize,
-    pool: Option<CpuPool>,
 }
 
 /// Wraps `R` with the original buffer being read into and the number of bytes read.
@@ -104,11 +106,13 @@ impl<R: Read + Send + 'static> BufReader<R> {
     pub fn with_pool_and_buf(pool: CpuPool, buf: Box<[u8]>, inner: R) -> BufReader<R> {
         let cap = buf.len();
         BufReader {
-            inner: inner,
-            buf: buf,
-            pos: cap,
-            cap: cap,
-            pool: Some(pool),
+            reader: BufReaderInner {
+                inner,
+                buf: buf,
+                pos: cap,
+                cap: cap,
+            },
+            pool: pool,
         }
     }
 
@@ -117,7 +121,7 @@ impl<R: Read + Send + 'static> BufReader<R> {
     /// It is likely invalid to read directly from the underlying reader and then use the `BufReader`
     /// again.
     pub fn get_ref(&self) -> &R {
-        &self.inner
+        &self.reader.inner
     }
 
     /// Gets a mutable reference to the underlying reader.
@@ -125,7 +129,7 @@ impl<R: Read + Send + 'static> BufReader<R> {
     /// It is likely invalid to read directly from the underlying reader and then use the `BufReader`
     /// again.
     pub fn get_mut(&mut self) -> &R {
-        &mut self.inner
+        &mut self.reader.inner
     }
 
     /// Sets the `BufReader`s internal buffer position to `pos`.
@@ -182,7 +186,7 @@ impl<R: Read + Send + 'static> BufReader<R> {
     /// # }
     /// ```
     pub unsafe fn set_pos(&mut self, pos: usize) {
-        self.pos = pos;
+        self.reader.pos = pos;
     }
 
     /// Returns the internal components of a `BufReader`, allowing reuse. This
@@ -207,12 +211,12 @@ impl<R: Read + Send + 'static> BufReader<R> {
     /// assert_eq!(buf.len(), 4<<10);
     /// # }
     /// ```
-    pub unsafe fn components(mut self) -> (R, Box<[u8]>, CpuPool) {
-        let r = mem::replace(&mut self.inner, mem::uninitialized());
-        let buf = mem::replace(&mut self.buf, mem::uninitialized());
-        let mut pool = mem::replace(&mut self.pool, mem::uninitialized());
-        let pool = pool.take().expect(EXP_POOL);
-        mem::forget(self);
+    pub unsafe fn components(self) -> (R, Box<[u8]>, CpuPool) {
+        let BufReader {
+            reader: BufReaderInner { inner: r, buf, .. },
+            pool,
+            ..
+        } = self;
         (r, buf, pool)
     }
 
@@ -258,16 +262,15 @@ impl<R: Read + Send + 'static> BufReader<R> {
     where
         B: DerefMut<Target = [u8]> + Send + 'static,
     {
-        const U8READ: &str = "&[u8] reads never error";
         let mut rem = buf.len();
         let mut at = 0;
 
-        if self.pos != self.cap {
-            at = (&self.buf[self.pos..self.cap]).read(&mut buf).expect(
-                U8READ,
-            );
+        if self.reader.pos != self.reader.cap {
+            at = (&self.reader.buf[self.reader.pos..self.reader.cap])
+                .read(&mut buf)
+                .expect(U8READ);
             rem -= at;
-            self.pos += at;
+            self.reader.pos += at;
 
             if rem == 0 {
                 return Either::A(ok::<OkRead<Self, B>, ErrRead<Self, B>>((self, buf, at)));
@@ -275,49 +278,45 @@ impl<R: Read + Send + 'static> BufReader<R> {
         }
         // self.pos == self.cap
 
-        let pool = self.pool.take().expect(EXP_POOL);
-
-        let block = if self.cap > 0 {
-            rem - rem % self.cap
+        let block = if self.reader.cap > 0 {
+            rem - rem % self.reader.cap
         } else {
             rem
         };
 
+        let BufReader { mut reader, pool } = self;
+
         let fut = pool.spawn_fn(move || {
             if block > 0 {
-                let (block_read, err) = try_read_full(&mut self.inner, &mut buf[at..at + block]);
+                let (block_read, err) = try_read_full(&mut reader.inner, &mut buf[at..at + block]);
                 if let Some(e) = err {
-                    return Err((self, buf, e));
+                    return Err((reader, buf, e));
                 }
 
                 at += block_read;
                 rem -= block_read;
                 if rem == 0 {
-                    return Ok((self, buf, at));
+                    return Ok((reader, buf, at));
                 }
             }
 
-            let (buf_read, err) = try_read_full(&mut self.inner, &mut self.buf);
+            let (buf_read, err) = try_read_full(&mut reader.inner, &mut reader.buf);
             match err {
-                Some(e) => Err((self, buf, e)),
+                Some(e) => Err((reader, buf, e)),
                 None => {
-                    self.cap = buf_read;
-                    self.pos = (&self.buf[..self.cap]).read(&mut buf[at..]).expect(U8READ);
-                    at += self.pos;
-                    Ok((self, buf, at))
+                    reader.cap = buf_read;
+                    reader.pos = (&reader.buf[..reader.cap]).read(&mut buf[at..]).expect(
+                        U8READ,
+                    );
+                    at += reader.pos;
+                    Ok((reader, buf, at))
                 }
             }
         });
 
         Either::B(fut.then(|res| match res {
-            Ok(mut x) => {
-                x.0.pool = Some(pool);
-                Ok(x)
-            }
-            Err(mut x) => {
-                x.0.pool = Some(pool);
-                Err(x)
-            }
+            Ok((reader, buf, at)) => Ok((BufReader { reader, pool }, buf, at)),
+            Err((reader, buf, at)) => Err((BufReader { reader, pool }, buf, at)),
         }))
     }
 }
@@ -366,7 +365,7 @@ fn test_read() {
             "foo does not exist?",
         ),
     );
-    assert_eq!(f.pos, 10);
+    assert_eq!(f.reader.pos, 10);
 
     // disk read, no blocks
     let (f, buf, n) = f.try_read_full(vec![0; 5]).wait().unwrap_or_else(
@@ -376,9 +375,9 @@ fn test_read() {
     );
     assert_eq!(n, 5);
     assert_eq!(&*buf, b"Strap");
-    assert_eq!(f.pos, 5);
-    assert_eq!(f.cap, 10);
-    assert_eq!(&*f.buf, b"Strapped d");
+    assert_eq!(f.reader.pos, 5);
+    assert_eq!(f.reader.cap, 10);
+    assert_eq!(&*f.reader.buf, b"Strapped d");
 
     // mem read only
     let (f, buf, n) = f.try_read_full(vec![0; 2]).wait().unwrap_or_else(
@@ -388,9 +387,9 @@ fn test_read() {
     );
     assert_eq!(n, 2);
     assert_eq!(&*buf, b"pe");
-    assert_eq!(f.pos, 7);
-    assert_eq!(f.cap, 10);
-    assert_eq!(&*f.buf, b"Strapped d");
+    assert_eq!(f.reader.pos, 7);
+    assert_eq!(f.reader.cap, 10);
+    assert_eq!(&*f.reader.buf, b"Strapped d");
 
     // mem (3) + disk blocks (20) + more mem (2)
     let (f, buf, n) = f.try_read_full(vec![0; 25]).wait().unwrap_or_else(
@@ -400,9 +399,9 @@ fn test_read() {
     );
     assert_eq!(n, 25);
     assert_eq!(&*buf, b"d down to my bed, feet co");
-    assert_eq!(f.pos, 2);
-    assert_eq!(f.cap, 10);
-    assert_eq!(&*f.buf, b"cold, eyes");
+    assert_eq!(f.reader.pos, 2);
+    assert_eq!(f.reader.cap, 10);
+    assert_eq!(&*f.reader.buf, b"cold, eyes");
 
     // mem (8) + disk block (10)
     let (f, buf, n) = f.try_read_full(vec![0; 18]).wait().unwrap_or_else(
@@ -412,9 +411,9 @@ fn test_read() {
     );
     assert_eq!(n, 18);
     assert_eq!(&*buf, b"ld, eyes red. I'm ");
-    assert_eq!(f.pos, 10);
-    assert_eq!(f.cap, 10);
-    assert_eq!(&*f.buf, b"cold, eyes"); // non-reset buf
+    assert_eq!(f.reader.pos, 10);
+    assert_eq!(f.reader.cap, 10);
+    assert_eq!(&*f.reader.buf, b"cold, eyes"); // non-reset buf
 
     // disk block (10)
     let (f, buf, n) = f.try_read_full(vec![0; 10]).wait().unwrap_or_else(
@@ -424,9 +423,9 @@ fn test_read() {
     );
     assert_eq!(n, 10);
     assert_eq!(&*buf, b"out of my ");
-    assert_eq!(f.pos, 10);
-    assert_eq!(f.cap, 10);
-    assert_eq!(&*f.buf, b"cold, eyes");
+    assert_eq!(f.reader.pos, 10);
+    assert_eq!(f.reader.cap, 10);
+    assert_eq!(&*f.reader.buf, b"cold, eyes");
 
     // disk block (20) + mem (9) (over-read by one byte)
     let (f, buf, n) = f.try_read_full(vec![0; 29]).wait().unwrap_or_else(
@@ -436,9 +435,9 @@ fn test_read() {
     );
     assert_eq!(n, 28);
     assert_eq!(&*buf, b"head. Am I alive? Am I dead?\0");
-    assert_eq!(f.pos, 8);
-    assert_eq!(f.cap, 8);
-    assert_eq!(&*f.buf, b" I dead?es");
+    assert_eq!(f.reader.pos, 8);
+    assert_eq!(f.reader.cap, 8);
+    assert_eq!(&*f.reader.buf, b" I dead?es");
 
     let (f, buf, n) = f.try_read_full(vec![0; 2]).wait().unwrap_or_else(
         |(_, _, e)| {
@@ -447,9 +446,9 @@ fn test_read() {
     );
     assert_eq!(n, 0);
     assert_eq!(&*buf, b"\0\0");
-    assert_eq!(f.pos, 0);
-    assert_eq!(f.cap, 0);
-    assert_eq!(&*f.buf, b" I dead?es");
+    assert_eq!(f.reader.pos, 0);
+    assert_eq!(f.reader.cap, 0);
+    assert_eq!(&*f.reader.buf, b" I dead?es");
 
     fs::remove_file("bar.txt").expect("expected file to be removed");
 }

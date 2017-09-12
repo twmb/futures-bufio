@@ -3,7 +3,6 @@ use futures::future::{Either, ok};
 use futures_cpupool::CpuPool;
 
 use std::io::{self, Write};
-use std::mem;
 use std::ops::Deref;
 
 use common::*;
@@ -52,11 +51,15 @@ use common::*;
 /// # }
 /// ```
 pub struct BufWriter<W> {
+    writer: BufWriterInner<W>,
+    pool: CpuPool,
+}
+
+struct BufWriterInner<W> {
     inner: W,
     buf: Box<[u8]>,
     pos: usize,
     w_start: usize,
-    pool: Option<CpuPool>,
 }
 
 /// Wraps `W` with the original buffer being written.
@@ -108,11 +111,13 @@ impl<W: Write + Send + 'static> BufWriter<W> {
     /// ```
     pub fn with_pool_and_buf(pool: CpuPool, buf: Box<[u8]>, inner: W) -> BufWriter<W> {
         BufWriter {
-            inner: inner,
-            buf: buf,
-            pos: 0,
-            w_start: 0,
-            pool: Some(pool),
+            writer: BufWriterInner {
+                inner: inner,
+                buf: buf,
+                pos: 0,
+                w_start: 0,
+            },
+            pool: pool,
         }
     }
 
@@ -121,7 +126,7 @@ impl<W: Write + Send + 'static> BufWriter<W> {
     /// It is likely invalid to read directly from the underlying writer and then use the
     /// `BufWriter` again.
     pub fn get_ref(&self) -> &W {
-        &self.inner
+        &self.writer.inner
     }
 
     /// Gets a mutable reference to the underlying writer.
@@ -129,7 +134,7 @@ impl<W: Write + Send + 'static> BufWriter<W> {
     /// It is likely invalid to read directly from the underlying writer and then use the
     /// `BufWriter` again.
     pub fn get_mut(&mut self) -> &W {
-        &mut self.inner
+        &mut self.writer.inner
     }
 
     /// Returns the internal components of a `BufWriter`, allowing reuse. This
@@ -154,12 +159,12 @@ impl<W: Write + Send + 'static> BufWriter<W> {
     /// assert_eq!(buf.len(), 4<<10);
     /// # }
     /// ```
-    pub unsafe fn components(mut self) -> (W, Box<[u8]>, CpuPool) {
-        let w = mem::replace(&mut self.inner, mem::uninitialized());
-        let buf = mem::replace(&mut self.buf, mem::uninitialized());
-        let mut pool = mem::replace(&mut self.pool, mem::uninitialized());
-        let pool = pool.take().expect(EXP_POOL);
-        mem::forget(self);
+    pub unsafe fn components(self) -> (W, Box<[u8]>, CpuPool) {
+        let BufWriter {
+            writer: BufWriterInner { inner: w, buf, .. },
+            pool,
+            ..
+        } = self;
         (w, buf, pool)
     }
 
@@ -214,7 +219,7 @@ impl<W: Write + Send + 'static> BufWriter<W> {
     /// # }
     /// ```
     pub unsafe fn set_pos(&mut self, pos: usize) {
-        self.pos = pos;
+        self.writer.pos = pos;
     }
 
     /// Writes all of `buf` to the `BufWriter`, returning the buffer for potential reuse and any
@@ -256,58 +261,53 @@ impl<W: Write + Send + 'static> BufWriter<W> {
         let mut at = 0;
         let mut write_buf = false;
 
-        if self.pos == 0 {
-            if buf.len() < self.buf.len() {
-                self.pos = copy(&mut self.buf, &*buf);
+        if self.writer.pos == 0 {
+            if buf.len() < self.writer.buf.len() {
+                self.writer.pos = copy(&mut self.writer.buf, &*buf);
                 return Either::A(ok::<OkWrite<Self, B>, ErrWrite<Self, B>>((self, buf)));
             }
         } else {
-            at = copy(&mut self.buf[self.pos..], &*buf);
-            self.pos += at;
+            at = copy(&mut self.writer.buf[self.writer.pos..], &*buf);
+            self.writer.pos += at;
             rem -= at;
 
-            if self.pos != self.buf.len() {
+            if self.writer.pos != self.writer.buf.len() {
                 return Either::A(ok::<OkWrite<Self, B>, ErrWrite<Self, B>>((self, buf)));
             }
             write_buf = true;
         }
 
-        let pool = self.pool.take().expect(EXP_POOL);
+        let BufWriter { mut writer, pool } = self;
+
         let fut = pool.spawn_fn(move || {
             if write_buf {
-                if let Err(e) = self.inner.write_all(&self.buf[self.w_start..]) {
-                    return Err((self, buf, e));
+                if let Err(e) = writer.inner.write_all(&writer.buf[writer.w_start..]) {
+                    return Err((writer, buf, e));
                 }
-                self.w_start = 0;
+                writer.w_start = 0;
             }
 
-            if rem >= self.buf.len() {
+            if rem >= writer.buf.len() {
                 let n_write = rem -
-                    if self.buf.len() != 0 {
-                        rem % self.buf.len()
+                    if writer.buf.len() != 0 {
+                        rem % writer.buf.len()
                     } else {
                         0
                     };
-                if let Err(e) = self.inner.write_all(&buf[at..at + n_write]) {
-                    return Err((self, buf, e));
+                if let Err(e) = writer.inner.write_all(&buf[at..at + n_write]) {
+                    return Err((writer, buf, e));
                 }
                 at += n_write;
                 rem -= n_write;
             }
 
-            self.pos = copy(&mut self.buf, &buf[at..]);
-            Ok((self, buf))
+            writer.pos = copy(&mut writer.buf, &buf[at..]);
+            Ok((writer, buf))
         });
 
         Either::B(fut.then(|res| match res {
-            Ok(mut x) => {
-                x.0.pool = Some(pool);
-                Ok(x)
-            }
-            Err(mut x) => {
-                x.0.pool = Some(pool);
-                Err(x)
-            }
+            Ok((writer, buf)) => Ok((BufWriter { writer, pool }, buf)),
+            Err((writer, buf, e)) => Err((BufWriter { writer, pool }, buf, e)),
         }))
     }
 
@@ -320,29 +320,27 @@ impl<W: Write + Send + 'static> BufWriter<W> {
     /// ```ignore
     /// let future = writer.flush_buf();
     /// ```
-    pub fn flush_buf(mut self) -> impl Future<Item = Self, Error = (Self, io::Error)> {
-        if self.w_start == self.pos {
+    pub fn flush_buf(self) -> impl Future<Item = Self, Error = (Self, io::Error)> {
+        if self.writer.w_start == self.writer.pos {
             return Either::A(ok::<Self, (Self, io::Error)>(self));
         }
 
-        let pool = self.pool.take().expect(EXP_POOL);
+        let BufWriter { mut writer, pool } = self;
+
         let fut = pool.spawn_fn(move || {
-            if let Err(e) = self.inner.write_all(&self.buf[self.w_start..self.pos]) {
-                return Err((self, e));
+            if let Err(e) = writer.inner.write_all(
+                &writer.buf[writer.w_start..writer.pos],
+            )
+            {
+                return Err((writer, e));
             }
-            self.w_start = self.pos;
-            Ok(self)
+            writer.w_start = writer.pos;
+            Ok(writer)
         });
 
         Either::B(fut.then(|res| match res {
-            Ok(mut me) => {
-                me.pool = Some(pool);
-                Ok(me)
-            }
-            Err(mut x) => {
-                x.0.pool = Some(pool);
-                Err(x)
-            }
+            Ok(writer) => Ok(BufWriter { writer, pool }),
+            Err((writer, e)) => Err((BufWriter { writer, pool }, e)),
         }))
     }
 
@@ -354,24 +352,18 @@ impl<W: Write + Send + 'static> BufWriter<W> {
     /// ```ignore
     /// let future = writer.flush_inner();
     /// ```
-    pub fn flush_inner(mut self) -> impl Future<Item = Self, Error = (Self, io::Error)> {
-        let pool = self.pool.take().expect(EXP_POOL);
+    pub fn flush_inner(self) -> impl Future<Item = Self, Error = (Self, io::Error)> {
+        let BufWriter { mut writer, pool } = self;
         let fut = pool.spawn_fn(move || {
-            if let Err(e) = self.inner.flush() {
-                return Err((self, e));
+            if let Err(e) = writer.inner.flush() {
+                return Err((writer, e));
             }
-            Ok(self)
+            Ok(writer)
         });
 
         fut.then(|res| match res {
-            Ok(mut me) => {
-                me.pool = Some(pool);
-                Ok(me)
-            }
-            Err(mut x) => {
-                x.0.pool = Some(pool);
-                Err(x)
-            }
+            Ok(writer) => Ok(BufWriter { writer, pool }),
+            Err((writer, e)) => Err((BufWriter { writer, pool }, e)),
         })
     }
 }
@@ -407,23 +399,23 @@ fn test_write() {
             panic!("unable to write to file: {}", e)
         },
     );
-    assert_eq!(f.pos, 5);
-    assert_eq!(f.w_start, 0);
+    assert_eq!(f.writer.pos, 5);
+    assert_eq!(f.writer.w_start, 0);
     assert_eq!(&*buf, b"hello");
     assert_foo("");
 
     let f = f.flush_buf().wait().unwrap_or_else(|(_, e)| {
         panic!("unable to flush buf: {}", e)
     });
-    assert_eq!(f.pos, 5);
-    assert_eq!(f.w_start, 5);
+    assert_eq!(f.writer.pos, 5);
+    assert_eq!(f.writer.w_start, 5);
     assert_foo("hello");
 
     let f = f.flush_inner().wait().unwrap_or_else(|(_, e)| {
         panic!("unable to flush file: {}", e)
     });
-    assert_eq!(f.pos, 5);
-    assert_eq!(f.w_start, 5);
+    assert_eq!(f.writer.pos, 5);
+    assert_eq!(f.writer.w_start, 5);
     assert_foo("hello");
 
     // memory (2) with w_start at 5
@@ -432,16 +424,16 @@ fn test_write() {
             panic!("unable to write to file: {}", e)
         },
     );
-    assert_eq!(f.pos, 7);
-    assert_eq!(f.w_start, 5);
+    assert_eq!(f.writer.pos, 7);
+    assert_eq!(f.writer.w_start, 5);
     assert_eq!(&*buf, b"tw");
     assert_foo("hello");
 
     let f = f.flush_buf().wait().unwrap_or_else(|(_, e)| {
         panic!("unable to flush buf: {}", e)
     });
-    assert_eq!(f.pos, 7);
-    assert_eq!(f.w_start, 7);
+    assert_eq!(f.writer.pos, 7);
+    assert_eq!(f.writer.w_start, 7);
     assert_foo("hellotw");
 
     // memory (7)
@@ -450,8 +442,8 @@ fn test_write() {
             panic!("unable to write to file: {}", e)
         },
     );
-    assert_eq!(f.pos, 4);
-    assert_eq!(f.w_start, 0);
+    assert_eq!(f.writer.pos, 4);
+    assert_eq!(f.writer.w_start, 0);
     assert_eq!(&*buf, b"goodbye");
     assert_foo("hellotwgoo");
 
@@ -459,8 +451,8 @@ fn test_write() {
     let (f, buf) = f.write_all(b"more++andthenten".to_vec())
         .wait()
         .unwrap_or_else(|(_, _, e)| panic!("unable to write to file: {}", e));
-    assert_eq!(f.pos, 0);
-    assert_eq!(f.w_start, 0);
+    assert_eq!(f.writer.pos, 0);
+    assert_eq!(f.writer.w_start, 0);
     assert_eq!(&*buf, b"more++andthenten");
     assert_foo("hellotwgoodbyemore++andthenten");
 
@@ -470,8 +462,8 @@ fn test_write() {
             panic!("unable to write to file: {}", e)
         },
     );
-    assert_eq!(f.pos, 0);
-    assert_eq!(f.w_start, 0);
+    assert_eq!(f.writer.pos, 0);
+    assert_eq!(f.writer.w_start, 0);
     assert_eq!(&*buf, b"andtenmore");
     assert_foo("hellotwgoodbyemore++andthentenandtenmore");
 
@@ -479,16 +471,16 @@ fn test_write() {
     let (f, buf) = f.write_all(b"this is rly old".to_vec())
         .wait()
         .unwrap_or_else(|(_, _, e)| panic!("unable to write to file: {}", e));
-    assert_eq!(f.pos, 5);
-    assert_eq!(f.w_start, 0);
+    assert_eq!(f.writer.pos, 5);
+    assert_eq!(f.writer.w_start, 0);
     assert_eq!(&*buf, b"this is rly old");
     assert_foo("hellotwgoodbyemore++andthentenandtenmorethis is rl");
 
     let f = f.flush_buf().wait().unwrap_or_else(|(_, e)| {
         panic!("unable to flush buf: {}", e)
     });
-    assert_eq!(f.pos, 5);
-    assert_eq!(f.w_start, 5);
+    assert_eq!(f.writer.pos, 5);
+    assert_eq!(f.writer.w_start, 5);
     assert_foo("hellotwgoodbyemore++andthentenandtenmorethis is rly old");
 
     fs::remove_file("foo.txt").expect("expected file to be removed");
