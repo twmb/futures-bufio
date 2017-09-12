@@ -160,7 +160,11 @@ impl<W: Write + Send + 'static> BufWriter<W> {
     /// # }
     /// ```
     pub unsafe fn components(self) -> (W, Box<[u8]>, CpuPool) {
-        let BufWriter { writer: BufWriterInner { inner: w, buf, .. }, pool, .. } = self;
+        let BufWriter {
+            writer: BufWriterInner { inner: w, buf, .. },
+            pool,
+            ..
+        } = self;
         (w, buf, pool)
     }
 
@@ -302,12 +306,8 @@ impl<W: Write + Send + 'static> BufWriter<W> {
         });
 
         Either::B(fut.then(|res| match res {
-            Ok((writer, buf)) => {
-                Ok((BufWriter { writer, pool }, buf))
-            }
-            Err((writer, buf, e)) => {
-                Err((BufWriter { writer, pool }, buf, e))
-            }
+            Ok((writer, buf)) => Ok((BufWriter { writer, pool }, buf)),
+            Err((writer, buf, e)) => Err((BufWriter { writer, pool }, buf, e)),
         }))
     }
 
@@ -328,7 +328,10 @@ impl<W: Write + Send + 'static> BufWriter<W> {
         let BufWriter { mut writer, pool } = self;
 
         let fut = pool.spawn_fn(move || {
-            if let Err(e) = writer.inner.write_all(&writer.buf[writer.w_start..writer.pos]) {
+            if let Err(e) = writer.inner.write_all(
+                &writer.buf[writer.w_start..writer.pos],
+            )
+            {
                 return Err((writer, e));
             }
             writer.w_start = writer.pos;
@@ -336,12 +339,8 @@ impl<W: Write + Send + 'static> BufWriter<W> {
         });
 
         Either::B(fut.then(|res| match res {
-            Ok(writer) => {
-                Ok(BufWriter { writer, pool })
-            }
-            Err((writer, e)) => {
-                Err((BufWriter { writer, pool }, e))
-            }
+            Ok(writer) => Ok(BufWriter { writer, pool }),
+            Err((writer, e)) => Err((BufWriter { writer, pool }, e)),
         }))
     }
 
@@ -363,12 +362,8 @@ impl<W: Write + Send + 'static> BufWriter<W> {
         });
 
         fut.then(|res| match res {
-            Ok(writer) => {
-                Ok(BufWriter { writer, pool })
-            }
-            Err((writer, e)) => {
-                Err((BufWriter { writer, pool }, e))
-            }
+            Ok(writer) => Ok(BufWriter { writer, pool }),
+            Err((writer, e)) => Err((BufWriter { writer, pool }, e)),
         })
     }
 }

@@ -212,7 +212,11 @@ impl<R: Read + Send + 'static> BufReader<R> {
     /// # }
     /// ```
     pub unsafe fn components(self) -> (R, Box<[u8]>, CpuPool) {
-        let BufReader { reader: BufReaderInner { inner: r, buf, .. }, pool, .. } = self;
+        let BufReader {
+            reader: BufReaderInner { inner: r, buf, .. },
+            pool,
+            ..
+        } = self;
         (r, buf, pool)
     }
 
@@ -262,9 +266,9 @@ impl<R: Read + Send + 'static> BufReader<R> {
         let mut at = 0;
 
         if self.reader.pos != self.reader.cap {
-            at = (&self.reader.buf[self.reader.pos..self.reader.cap]).read(&mut buf).expect(
-                U8READ,
-            );
+            at = (&self.reader.buf[self.reader.pos..self.reader.cap])
+                .read(&mut buf)
+                .expect(U8READ);
             rem -= at;
             self.reader.pos += at;
 
@@ -301,7 +305,9 @@ impl<R: Read + Send + 'static> BufReader<R> {
                 Some(e) => Err((reader, buf, e)),
                 None => {
                     reader.cap = buf_read;
-                    reader.pos = (&reader.buf[..reader.cap]).read(&mut buf[at..]).expect(U8READ);
+                    reader.pos = (&reader.buf[..reader.cap]).read(&mut buf[at..]).expect(
+                        U8READ,
+                    );
                     at += reader.pos;
                     Ok((reader, buf, at))
                 }
@@ -309,12 +315,8 @@ impl<R: Read + Send + 'static> BufReader<R> {
         });
 
         Either::B(fut.then(|res| match res {
-            Ok((reader, buf, at)) => {
-                Ok((BufReader { reader, pool }, buf, at))
-            }
-            Err((reader, buf, at)) => {
-                Err((BufReader { reader, pool }, buf, at))
-            }
+            Ok((reader, buf, at)) => Ok((BufReader { reader, pool }, buf, at)),
+            Err((reader, buf, at)) => Err((BufReader { reader, pool }, buf, at)),
         }))
     }
 }
